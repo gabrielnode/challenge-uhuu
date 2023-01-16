@@ -1,0 +1,37 @@
+version: '3.3'
+services:
+  backend-uhuu:
+    container_name: backend-uhuu
+    build:
+      context: './'
+      dockerfile: ./devops/Dockerfile
+    volumes:
+      - .:/app
+    ports:
+      - '3000:3000'
+    depends_on:
+      - postgres
+    networks:
+      - pg
+  postgres:
+    container_name: postgres
+    image: postgres
+    restart: always
+    environment:
+      - POSTGRES_USER=admin
+      - POSTGRES_PASSWORD=admin
+      - POSTGRES_DB=parser
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORTS=5432
+      - PGDATA=/postgres-data
+    ports:
+      - '5432:5432'
+    volumes:
+      - ./devops/postgres-data:/var/lib/postgresql/data
+      - ./devops/database/database.sql:/docker-entrypoint-initdb.d/database.sql
+    networks:
+      - pg
+
+networks:
+  pg:
+    external: true

@@ -1,0 +1,251 @@
+def pipelineConfig = [
+    deploy: [
+        master: [
+            FORTIFY_ENVIRONMENT: '1.0.0',
+        ],
+        release: [
+            FORTIFY_ENVIRONMENT: 'release',
+        ],
+        develop: [
+            FORTIFY_ENVIRONMENT: 'develop',
+        ],    
+    ],
+]
+
+def SetPath(nodejsversion) {
+    return sh (script: ". nvmuse " + nodejsversion,returnStdout: true).trim()
+}
+
+pipeline {
+    agent { node { label 'linux && nodejs' } }
+    environment {
+        PROJECT_NAME                = "ms-payment-origination"   
+        VERSION                     = "0.0.1"
+        NODEJS_VERSION              = "v16"
+        PATH                        = SetPath("${env.NODEJS_VERSION}")
+        REVISION                    = "${BUILD_NUMBER}"
+        COMMIT_HASH                 = "${env.GIT_COMMIT[0..7]}"        
+        SLACK_CHANNEL               = "#ms-payment-monitoring"
+        AZURE_TENANT_ID             = credentials('azureTenantId')
+        AZURE_APP_ID                = credentials('azureAppId')
+        AZURE_APP_PASS              = credentials('azureAppPass')
+        SONAR_TOKEN                 = credentials('sonar_token')
+        SONAR_URL                   = credentials('sonar_url')
+        DOCKER_REPOSITORY           = credentials('DOCKER_REPOSITORY')
+        DOCKER_USER_LOGIN           = credentials('DOCKER_USER_LOGIN')
+        DOCKER_USER_PASS            = credentials('DOCKER_USER_PASS')
+        KUBECONFIG_DEV              = credentials('nsp_dev')        
+        KUBECONFIG_HML              = credentials('nsp_hmg')
+        KUBECONFIG_PRD              = credentials('nsp_prd')
+        DASA_FORTIFY_TOKEN = credentials('dasa_fortify_token')
+        DASA_FORTIFY_JAR = "$WORKSPACE/devops/fortify/bin/fortify-api-client-0.0.6-jar-with-dependencies.jar"
+        DASA_FORTIFY_PROPERTIES = "$WORKSPACE/devops/fortify/bin/fortify.properties"
+        DASA_FORTIFY_PROJECTSFILE = "$WORKSPACE/devops/fortify/bin/projects.reference"
+        DASA_FORTIFY_LANGUAGESFILE = "$WORKSPACE/devops/fortify/bin/languages.reference"
+        PRISMA_SECRET = credentials('PRISMA_SECRET')
+        PRISMA_KEY = credentials('PRISMA_KEY')
+        FORTIFY_CLIENT_TOKEN = credentials('FORTIFY_CLIENT_TOKEN')
+        NEXUS_IQ_TOKEN = credentials('NEXUS_IQ_TOKEN')
+        DASA_FORTIFY_ACCESSIBILITY = "externalpublicnetwork"
+        DASA_FORTIFY_DEV_PHASE = "Active"
+        DASA_FORTIFY_DATA = "dados_sensiveis_pessoais"
+        DASA_FORTIFY_URL = "${pipelineConfig.deploy[env.GIT_BRANCH].URL}"
+        TYPE_COMPILE_LANG = 'npm'
+        DASA_FORTIFY_PRODUCT = 'Nav Pagamentos'
+        DASA_FORTIFY_VERSION = "${pipelineConfig.deploy[env.GIT_BRANCH].FORTIFY_ENVIRONMENT}"
+        ENABLE_FORTIFY = 'NO_WAITING'
+        DASA_FORTIFY_EXCLUSIONS = 'node_modules,dist,build,devops,docker,scannerwork,.yarn,coverage,test'
+    }
+    options { timeout(time: 1, unit: 'HOURS') }
+    stages {
+        stage('Slack Message - START') {
+            when { expression { pipelineConfig.deploy.keySet().contains(env.GIT_BRANCH) } }
+            steps {
+                slackSend (color: '#BADA55', message: "Starting build  ${env.BUILD_URL}", channel: '#ms-payments-monitoring')
+            }
+        }
+        stage('Setup Environment') {
+            when { expression { pipelineConfig.deploy.keySet().contains(env.GIT_BRANCH) } }
+            steps {
+                script{
+                    env.ENVIRONMENT = ""
+                    env.KUBECONFIG = ""
+                    if (env.GIT_BRANCH ==~ /.*master/) {
+                        env.ENVIRONMENT = "production"
+                        env.KUBECONFIG =  "${env.KUBECONFIG_PRD}"
+                        env.IMAGE_VERSION = "$DOCKER_REPOSITORY/$ENVIRONMENT/$PROJECT_NAME:$VERSION-$COMMIT_HASH"
+                        env.DOCKERFILE = "Dockerfile"
+                    } else if (env.GIT_BRANCH.contains('release')) {
+                        env.ENVIRONMENT = "homolog"
+                        env.KUBECONFIG =  "${env.KUBECONFIG_HML}"
+                        env.IMAGE_VERSION = "$DOCKER_REPOSITORY/$ENVIRONMENT/$PROJECT_NAME:$VERSION-$COMMIT_HASH"
+                        env.DOCKERFILE = "hml.Dockerfile"
+                    } else if (env.GIT_BRANCH ==~ /.*develop/) {
+                        env.ENVIRONMENT = "develop"
+                        env.KUBECONFIG =  "${env.KUBECONFIG_DEV}"
+                        env.IMAGE_VERSION = "$DOCKER_REPOSITORY/$ENVIRONMENT/$PROJECT_NAME:$VERSION-$COMMIT_HASH"
+                        env.DOCKERFILE = "dev.Dockerfile"
+                    } else {
+                        currentBuild.result = 'ABORTED'
+                        error('Pipe nao roda para outras branches. Necessário implementar')
+                    }
+                    sh  '''echo Environment = $ENVIRONMENT'''
+                    slackSend (color: '#BADA55', message: "Enviroment - ${env.ENVIRONMENT}", channel: '#ms-payments-monitoring')
+                }
+            }
+        }
+        stage('Prepare environment') {
+            when { expression { pipelineConfig.deploy.keySet().contains(env.GIT_BRANCH) } }
+            steps {
+                script {
+                    env.IMAGE_NAME="$DOCKER_REPOSITORY/$PROJECT_NAME"
+                    sh """
+                        echo Environment = ${ENVIRONMENT}
+                        echo Version = ${VERSION}
+                        echo BUILD_NUMBER = ${BUILD_NUMBER}
+                        echo IMAGE_NAME = ${IMAGE_NAME}
+                        echo GIT_BRANCH = ${env.GIT_BRANCH}
+                        echo PROJECT_NAME = ${env.PROJECT_NAME}
+                    """
+                }
+            }
+        }
+        
+        stage('AZ login') {
+            when { expression { pipelineConfig.deploy.keySet().contains(env.GIT_BRANCH) } }
+            steps {
+                sh '''az login -u $AZURE_APP_ID -p $AZURE_APP_PASS --service-principal --tenant $AZURE_TENANT_ID
+                    az acr login --name imagesdasa'''
+            }
+        }
+        stage('Build Docker images') {
+            when { expression { pipelineConfig.deploy.keySet().contains(env.GIT_BRANCH) } }
+            steps {
+                sh '''docker build -t $IMAGE_VERSION -f devops/$DOCKERFILE .'''
+            }
+        }
+        stage('Upload Docker images') {
+            when { expression { pipelineConfig.deploy.keySet().contains(env.GIT_BRANCH) } }
+            steps {
+                parallel(
+                    "Push branch tag": {
+                        sh "echo docker push $IMAGE_VERSION"
+                    },
+                    "Push commit tag": {
+                        sh "docker push $IMAGE_VERSION"
+                        sh "echo DOCKER_IMAGE_PUSH = $IMAGE_VERSION"
+                    }
+                )
+            }
+        }
+
+        stage('Scan Fortify') {
+            parallel {
+                stage('Develop/Homolog') {
+                    when {
+                    not {
+                        expression {
+                            env.GIT_BRANCH ==~ /master/
+                        }
+                    }
+                    }
+                    steps {
+                        checkout([$class: 'GitSCM', branches: [[name: '*/master']], doGenerateSubmoduleConfigurations: false, extensions: [[$class: 'RelativeTargetDirectory', relativeTargetDir: 'devops/fortify']], submoduleCfg: [], userRemoteConfigs: [[url: 'git@bitbucket.org:dasa_desenv/sec-fortify.git']]])
+                        sh "yarn cache clean; rm -rf node_modules; yarn --production --frozen-lockfile"
+                        sh "$WORKSPACE/devops/fortify/fortify.sh -f"
+                    }
+                }
+                // stage('Release(Rollback)') {
+                //     when {
+                //         expression {
+                //             env.GIT_BRANCH ==~ /release-.*/
+                //         }
+                //     }
+                //     steps {
+                //         sh "echo 'Fortify will not run on release branches for rollback purposes!'"
+                //     }
+                // }
+                stage('Production') {
+                    when {
+                        expression {
+                            env.GIT_BRANCH ==~ /master/
+                        }
+                    }
+                    steps {
+                        checkout([$class: 'GitSCM', branches: [[name: '*/master']], doGenerateSubmoduleConfigurations: false, extensions: [[$class: 'RelativeTargetDirectory', relativeTargetDir: 'devops/fortify']], submoduleCfg: [], userRemoteConfigs: [[url: 'git@bitbucket.org:dasa_desenv/sec-fortify.git']]])
+                        sh "yarn cache clean; rm -rf node_modules; yarn --production --frozen-lockfile"
+                        sh "$WORKSPACE/devops/fortify/fortify.sh -v"
+                    }
+                }
+            }
+        }
+
+        stage('Install Dependencies') {
+            when { expression { pipelineConfig.deploy.keySet().contains(env.GIT_BRANCH) } }
+            steps {
+                sh 'npm i -g yarn'
+                sh 'rm -rf node_modules; yarn install --frozen-lockfile --cache-folder .yarn'
+            }
+        }
+        stage('Tests') {
+            when { expression { pipelineConfig.deploy.keySet().contains(env.GIT_BRANCH) } }
+            steps {
+                sh 'yarn test:cov'
+            }
+        }
+        stage('Scan SonarQube') {
+            when { expression { pipelineConfig.deploy.keySet().contains(env.GIT_BRANCH) } }
+            steps {
+                withSonarQubeEnv('SonarQube') {
+                    sh  'yarn sonar -Dsonar.projectKey=$PROJECT_NAME -Dsonar.projectName=$PROJECT_NAME -Dsonar.projectVersion=$VERSION-$REVISION -Dsonar.host.url=$SONAR_URL -Dsonar.token=$SONAR_TOKEN -Dsonar.sourceEncoding=UTF-8'
+                }
+            }
+        }
+        stage("Quality Gate") {
+            when { expression { pipelineConfig.deploy.keySet().contains(env.GIT_BRANCH) } }
+            steps {
+                timeout(time: 10, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+
+        stage('Approved to PRD') {
+            when {
+                expression {
+                env.GIT_BRANCH ==~ /.*master/
+                }
+            }
+            options {
+                timeout(time: 3600, unit: 'SECONDS')
+            }
+            steps {
+                input(
+                id: 'Proceed', message: 'Was this successful?', parameters: [
+                    [$class: 'BooleanParameterDefinition', defaultValue: true, description: '', name: 'Package Approved to deploy in PRD ? (Click "Proceed" to continue)']
+                ])
+                script {
+                sh '''echo APPROVED to PRD!'''
+                }
+            }
+        }
+
+        stage('Deploy') {
+            when { expression { pipelineConfig.deploy.keySet().contains(env.GIT_BRANCH) } }
+            steps {
+                slackSend (color: '#10ADED', message: "[DOING] [${env.JOB_NAME}/${env.BUILD_NUMBER}] Reading k8s file and deploying...", channel: '#ms-payments-monitoring')
+                sh '''sed 's|\${IMAGE_VERSION}|'"${IMAGE_VERSION}"'|g' -i ./devops/kubernetes/$ENVIRONMENT.yaml
+                        sed 's|\${PROJECT_NAME}|'"${PROJECT_NAME}"'|g' -i ./devops/kubernetes/$ENVIRONMENT.yaml
+
+                        cat ./devops/kubernetes/$ENVIRONMENT.yaml
+                        kubectl apply --kubeconfig=$KUBECONFIG -f ./devops/kubernetes/$ENVIRONMENT.yaml --validate=false --insecure-skip-tls-verify'''
+                slackSend (color: '#1A5E25', message: "[DONE] [${env.JOB_NAME}/${env.BUILD_NUMBER}] K8s file read and deploy done!", channel: '#ms-payments-monitoring')
+            }
+        }        
+        stage('Slack Message - END') {
+            steps {
+                slackSend (color: '#BADA55', message: "End of build  ${env.BUILD_URL} for ${env.ENVIRONMENT}", channel: '#ms-payments-monitoring')
+            }
+        }
+    }
+}

@@ -1,0 +1,16 @@
+node_modules
+coverage
+.vscode
+log
+test
+.prettierrc
+devops
+dist
+.dccache
+.eslintignore
+.eslintrc.js
+.gitignore
+.lintstagedrc.json
+.snyk
+changelog-template.hbs
+.husky
